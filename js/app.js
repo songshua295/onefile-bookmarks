@@ -692,6 +692,8 @@ function handleQuickAdd() {
   openBookmarkModal({ mode: 'add' });
   $('#f-title').value = title || '';
   $('#f-url').value = url;
+  // 查重挂在 input 事件上,脚本赋值不会触发:手动派发一次,快速添加也要走同一套「已收藏过」提示
+  $('#f-url').dispatchEvent(new Event('input', { bubbles: true }));
   setStatus('快速添加:确认后保存' + (state.config.autoUpload ? ',将自动上传' : ''));
   const okBtn = $('#f-ok');
   okBtn.addEventListener('click', () => {
