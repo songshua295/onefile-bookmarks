@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>书签</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22><path d=%22M6 2h12v20l-6-4.5L6 22z%22 fill=%22%23a63b2a%22/></svg>">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header id="topbar">
+  <div class="row1">
+    <span id="logo">书签</span>
+    <span id="recents-label">最近打开</span>
+    <div id="recents"></div>
+    <span id="dirty-badge" hidden>● 未上传</span>
+  </div>
+  <div class="row2">
+    <input id="search" type="search" autocomplete="off"
+           placeholder="搜索书签…(空格分隔多个关键字,支持模糊匹配)">
+    <span class="btn-sep"></span>
+    <button id="collapse-btn" class="btn-fn" title="收缩所有展开的书签文件夹">全部收缩</button>
+    <button id="add-bm-btn" class="btn-fn" title="添加书签(可选择或搜索文件夹)">+ 书签</button>
+    <button id="add-folder-btn" class="btn-fn" title="添加文件夹">+ 文件夹</button>
+    <span class="btn-sep"></span>
+    <button id="upload-btn" class="btn-fn" title="把当前书签(含修改和点击次数)上传到云端;日期模式会生成带今天日期的新备份文件">上传</button>
+    <span class="more-wrap">
+      <button id="more-btn" class="btn-fn" title="更多功能">更多</button>
+      <div id="more-menu" hidden>
+        <button id="download-btn" title="把云端最新的书签 HTML 文件下载到本地">下载云端书签</button>
+        <button id="import-btn" title="选择本地书签 HTML 文件,用它覆盖云端全部数据(慎用)">用本地文件覆盖云端…</button>
+        <a id="bookmarklet" href="#" title="把我拖到浏览器书签栏,之后在任何页面点击即可快速收藏">获取快速添加按钮…</a>
+      </div>
+    </span>
+    <input id="import-file" type="file" accept=".html,text/html" hidden>
+    <span id="status"></span>
+  </div>
+</header>
+<main id="content">
+  <div id="tree"></div>
+  <div id="results" hidden></div>
+</main>
+
+<div id="modal-root" hidden>
+  <div id="modal-mask"></div>
+  <div id="modal-box"></div>
+</div>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

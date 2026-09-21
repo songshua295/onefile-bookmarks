@@ -1,0 +1,14 @@
+{
+  "name": "bookmark-web",
+  "version": "1.0.0",
+  "private": true,
+  "description": "静态书签页面:读取 Netscape 书签 HTML,支持树形展示、模糊/多关键字/AI 搜索、S3/WebDAV 上传",
+  "main": "serve.js",
+  "scripts": {
+    "dev": "node serve.js",
+    "start": "node serve.js"
+  },
+  "dependencies": {
+    "aws4fetch": "^1.0.20"
+  }
+}
