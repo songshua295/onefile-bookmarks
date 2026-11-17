@@ -1,5 +1,8 @@
-let uidSeq = 0;
-export function newId() { uidSeq += 1; return 'n' + uidSeq; }
+// 节点 id:稳定 UUID。跨设备、跨解析保持一致,是节点级增量同步的前提
+export function newId() {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+  return 'n' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+}
 
 export function parseBookmarkHTML(html) {
   uidSeq = 0;

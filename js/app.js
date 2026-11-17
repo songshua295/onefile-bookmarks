@@ -1,5 +1,6 @@
 import { parseBookmarkHTML, serializeBookmarkHTML } from './parser.js';
-import { state, loadMeta, mergeRemoteMeta, recordOpen, syncMetaNow, clearDirty, saveCache, markDirty, defaultExpand, collapseAllFolders, applyClicksToAttrs, syncClicksFromAttrs, clicksClass } from './store.js';
+import { treeToNodes, nodesToTree, diffNodes, newId } from './model.js';
+import { state, loadCache, loadMeta, mergeRemoteMeta, recordOpen, syncMetaNow, clearDirty, defaultExpand, collapseAllFolders, applyClicksToAttrs, syncClicksFromAttrs, clicksClass } from './store.js';
 import { renderTree, wireTreeEvents, buildIndex, findNode, findParent, findToolbarFolder, pathOf, addBookmark, addFolder, updateNode, deleteNode, ensureFolderPath } from './tree.js';
 import { flatten, flattenFolders, searchBookmarks } from './search.js';
 import { icoGlobe, icoCode } from './icons.js';
@@ -22,37 +23,107 @@ function getFlat() {
   return flatCache;
 }
 
-// 带访问口令的 fetch;401 时清除缓存令牌并提示重新输入
+// 带访问口令的 fetch;401 时清除缓存令牌,响应原样返回由调用方处理
 async function api(path, opts = {}) {
   const token = localStorage.getItem(AUTH_KEY) || '';
   opts.headers = Object.assign({}, opts.headers, token ? { 'x-auth': token } : {});
   const r = await fetch(path, opts);
-  if (r.status === 401) {
-    localStorage.removeItem(AUTH_KEY);
-    throw new Error('需要访问密码,请刷新页面重新输入');
-  }
+  if (r.status === 401) localStorage.removeItem(AUTH_KEY);
   return r;
 }
 
 init();
 
+// 旧版 v1 localStorage 缓存(整树 JSON):迁移时使用
+let legacyCache = null;
+
 async function init() {
   loadMeta();
-  state.config = await fetchConfig();
+
+  // 1) 缓存优先:有本地缓存立即渲染首屏,云端校验放到后台,首屏不再等网络
+  const cache = await loadCache();
+  let booted = false;
+  if (cache && cache.v === 2 && Array.isArray(cache.nodes)) {
+    state.base = cache.base || {};
+    state.since = cache.since || 0;
+    state.rev = cache.rev || 0;
+    state.lineage = cache.lineage || null;
+    state.etag = cache.etag || null;
+    state.dirty = !!cache.dirty;
+    state.tree = nodesToTree(cache.nodes);
+    boot();
+    booted = true;
+  } else if (cache && cache.tree) {
+    legacyCache = cache;   // 旧版 v1 缓存:留给迁移逻辑
+    if (cache.dirty) {
+      // 带未上传修改的旧缓存:直接以它为工作副本,上传时再与云端按条合并
+      state.tree = cache.tree;
+      state.dirty = true;
+      state.base = {};
+      boot();
+      booted = true;
+    }
+  }
+
+  // 2) 配置与云端增量并行拉取;带 If-None-Match,云端未变化时 304 几乎零流量
+  const cfgPromise = fetchConfig();
+  const syncPromise = state.dirty ? Promise.resolve({ status: 'skip' }) : fetchSyncDelta();
+  state.config = await cfgPromise;
 
   // 可选访问密码:配置了且本地没有记住的令牌时,先解锁
   if (state.config.needAuth && !localStorage.getItem(AUTH_KEY)) {
     const ok = await promptPassword();
-    if (!ok) { setStatus('未解锁:输入密码后才能读写云端数据'); return; }
+    if (!ok) {
+      setStatus('未解锁:输入密码后才能读写云端数据');
+      if (!booted) return;
+    }
   }
 
-  await loadData();
+  let sync = await syncPromise;
+  // 首个并行请求可能发生在解锁前(401):解锁后重试一次
+  if ((!sync || sync.status === 401) && state.config.storageType !== 'none' && localStorage.getItem(AUTH_KEY)) {
+    sync = state.dirty ? { status: 'skip' } : await fetchSyncDelta();
+  }
+
+  if (state.config.storageType !== 'none') {
+    if (!sync || sync.status === 'skip' || sync.status === 401) {
+      // 网络失败/带 dirty 跳过:保留现有数据
+      if (state.dirty) setStatus('⚠ 本地有未上传的修改;点「上传」会与云端按条自动合并');
+    } else if (sync.status === 304) {
+      // 云端未变化,当前数据即最新
+    } else if (sync.status === 404) {
+      if (booted) setStatus('⚠ 云端数据文件不存在,点「上传」可重建');
+      else await migrateFromLegacy();
+    } else if (sync.status === 200) {
+      if (state.dirty) {
+        setStatus('⚠ 本地有未上传的修改;点「上传」会与云端按条自动合并');
+      } else {
+        applySyncDelta(sync.j);
+        if (!booted) { boot(); booted = true; }
+      }
+    }
+  }
+
+  // 没有任何数据(未配置存储/云端不可用):回退本地文件
+  if (!state.tree) await loadLocalFallback();
+  if (!state.tree) return;
+  if (!booted) boot();
+
+  if (state.dirty && state.config.storageType !== 'none') {
+    setStatus('⚠ 本地有未上传的修改;点「上传」会与云端按条自动合并');
+  }
+
+  await mergeRemote();
+  handleQuickAdd();
+}
+
+// 首屏装配:索引、渲染、事件只挂一次;后续数据刷新只重渲染,不重复绑定
+function boot() {
   buildIndex(state.tree);
   syncClicksFromAttrs(state.tree);
   defaultExpand(state.tree);
   renderTree($('#tree'));
   wireTreeEvents($('#tree'), { onAction, onOpen: renderRecents, onMoved });
-
   renderBookmarklet();
   renderRecents();
   // resize 时重建最近打开条很便宜地频繁触发:防抖
@@ -60,8 +131,7 @@ async function init() {
   window.addEventListener('resize', () => { clearTimeout(rzTimer); rzTimer = setTimeout(renderRecents, 150); });
   wireSearch();
   wireButtons();
-  await mergeRemote();
-  handleQuickAdd();
+  updateDirtyBadge();
 }
 
 async function fetchConfig() {
@@ -72,37 +142,136 @@ async function fetchConfig() {
   return { storageType: 'none', uploadMode: 'overwrite', autoUpload: false, aiEnabled: false, needAuth: false, localFile: LOCAL_FALLBACK };
 }
 
-async function loadData() {
-  const cache = JSON.parse(localStorage.getItem('bm_cache_v1') || 'null');
-  let html = null, etag = null;
+// ---------- 云端同步:解析后的节点级增量 ----------
+// GET /api/sync?since=<毫秒>&lineage=<谱系>:只返回 since 之后变化的节点;
+// 带 If-None-Match 时云端未变化返回 304;lineage 不一致/首次访问返回全量
+async function fetchSyncDelta() {
+  try {
+    const q = new URLSearchParams({ since: String(state.since || 0) });
+    if (state.lineage) q.set('lineage', state.lineage);
+    const headers = {};
+    if (state.etag && !state.dirty) headers['If-None-Match'] = state.etag;
+    const r = await api('/api/sync?' + q.toString(), { cache: 'no-store', headers });
+    if (r.status === 304) return { status: 304 };
+    if (r.status === 404) return { status: 404 };
+    if (!r.ok) return { status: r.status };
+    return { status: 200, j: await r.json() };
+  } catch { return null; }   // 网络失败/无后端
+}
 
-  if (state.config.storageType !== 'none') {
-    try {
-      const r = await api('/api/bookmark?type=bookmark', { cache: 'no-store' });
-      if (r.ok) { etag = r.headers.get('ETag'); html = await r.text(); }
-    } catch { /* 忽略,回退本地文件 */ }
-  }
-  if (!html) {
-    const file = state.config.localFile || LOCAL_FALLBACK;
-    try { html = await (await fetch(file)).text(); }
-    catch { setStatus('无法加载数据:' + file); return; }
-    if (state.config.storageType === 'none') setStatus('未配置远程存储,使用本地文件(只读模式)');
-  }
-
-  if (cache && cache.tree && cache.dirty) {
-    state.tree = cache.tree;
-    state.dirty = true;
-    state.etag = cache.etag;
-    if (etag && cache.etag !== etag) setStatus('⚠ 远程文件已有更新,当前显示的是本地未上传的修改');
-  } else if (cache && cache.tree && cache.etag && cache.etag === etag) {
-    state.tree = cache.tree;
-    state.etag = etag;
-  } else {
-    state.tree = parseBookmarkHTML(html);
-    state.etag = etag;
-    clearDirty();
-  }
+// 把云端响应落到本地:更新基线/游标,重建树并重渲染(节点 id 稳定,折叠状态不丢)
+function applySyncDelta(j) {
+  if (!j) return;
+  state.lineage = j.lineage || state.lineage;
+  state.rev = typeof j.rev === 'number' ? j.rev : state.rev;
+  state.etag = j.etag || null;
+  if (typeof j.updatedAt === 'number') state.since = Math.max(state.since, j.updatedAt);
+  if (j.full) state.base = {};
+  for (const n of (j.nodes || [])) state.base[n.id] = n;
+  state.tree = nodesToTree(Object.values(state.base));
+  flatCache = null;
+  buildIndex(state.tree);
+  syncClicksFromAttrs(state.tree);
+  renderTree($('#tree'));
+  renderRecents();
   updateDirtyBadge();
+}
+
+// lineage 分叉(云端被另一端整份重建):以云端为基线,本地修改保留待重新 diff
+function rebaseFromServer(j) {
+  state.base = {};
+  for (const n of (j.nodes || [])) state.base[n.id] = n;
+  state.lineage = j.lineage || null;
+  state.rev = j.rev || 0;
+  state.etag = null;
+  state.since = j.updatedAt || 0;
+}
+
+async function loadLocalFallback() {
+  // 旧版 v1 缓存兜底
+  if (legacyCache && legacyCache.tree) {
+    state.tree = legacyCache.tree;
+    state.dirty = !!legacyCache.dirty;
+    state.base = {};
+    if (state.config.storageType === 'none') setStatus('未配置远程存储,使用本地缓存(只读模式)');
+    return;
+  }
+  const file = state.config.localFile || LOCAL_FALLBACK;
+  try {
+    const html = await (await fetch(file)).text();
+    state.tree = parseBookmarkHTML(html);
+    state.base = {};
+    state.etag = null;
+    clearDirty();
+  } catch { setStatus('无法加载数据:' + file); return; }
+  if (state.config.storageType === 'none') setStatus('未配置远程存储,使用本地文件(只读模式)');
+}
+
+// 云端还没有 JSON 数据:从旧 HTML(或带未上传修改的 v1 缓存)构建首份数据
+async function migrateFromLegacy() {
+  let tree = null;          // 工作副本(以后续上传的数据源)
+  let baseRecs = null;      // 同步基线(云端 HTML 的解析结果)
+  let dirty = false;
+  let htmlTree = null;
+  try {
+    const r = await api('/api/bookmark?type=bookmark', { cache: 'no-store' });
+    if (r.ok) htmlTree = parseBookmarkHTML(await r.text());
+  } catch { /* 忽略,回退缓存 */ }
+
+  if (legacyCache && legacyCache.tree && legacyCache.dirty) {
+    // 本地有未上传的修改:以缓存树为工作副本、云端 HTML 为基线 → diff 恰好是本地改动
+    tree = legacyCache.tree;
+    baseRecs = htmlTree ? treeToNodes(htmlTree) : treeToNodes(legacyCache.tree);
+    dirty = true;
+  } else if (htmlTree) {
+    tree = htmlTree;
+    baseRecs = treeToNodes(htmlTree);
+  } else if (legacyCache && legacyCache.tree) {
+    tree = legacyCache.tree;
+    baseRecs = treeToNodes(legacyCache.tree);
+    dirty = !!legacyCache.dirty;
+  }
+  if (!tree) { await loadLocalFallback(); return; }
+
+  state.tree = tree;
+  state.base = {};
+  for (const rec of baseRecs) state.base[rec.id] = rec;
+  state.since = 0; state.rev = 0; state.lineage = null; state.etag = null;
+  flatCache = null;
+  buildIndex(tree);
+  syncClicksFromAttrs(tree);
+  renderTree($('#tree'));
+  renderRecents();
+  updateDirtyBadge();
+  if (dirty) {
+    state.dirty = true;
+    updateDirtyBadge();
+    setStatus('⚠ 检测到旧版未上传的本地修改;点「上传」会写入新版云端数据');
+  } else {
+    const ok = await seedUpload();
+    if (ok) setStatus('✅ 已完成云端数据迁移(HTML → JSON)');
+  }
+}
+
+// 首次迁移:整份数据推到云端建立 JSON(之后所有上传都是增量)
+async function seedUpload() {
+  try {
+    const recs = treeToNodes(state.tree);
+    const now = Date.now();
+    for (const r of recs) r.updatedAt = now;
+    const r = await api('/api/sync', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, cache: 'no-store',
+      body: JSON.stringify({ lineage: newId(), replace: true, nodes: recs })
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) throw new Error(j.error || r.status);
+    clearDirty();
+    applySyncDelta(j);
+    return true;
+  } catch (e) {
+    setStatus('❌ 初始化云端 JSON 失败:' + e.message);
+    return false;
+  }
 }
 
 async function mergeRemote() {
@@ -145,8 +314,10 @@ function renderRecents() {
     a.addEventListener('click', () => recordOpen(url));
     box.appendChild(a);
   }
-  // 按可用宽度裁剪,只显示放得下的条目
-  while (box.scrollWidth > box.clientWidth && box.children.length > 1) box.removeChild(box.lastChild);
+  // 按可用宽度裁剪,只显示放得下的条目;移动端改为横向滚动,不裁剪
+  if (!window.matchMedia('(max-width: 640px)').matches) {
+    while (box.scrollWidth > box.clientWidth && box.children.length > 1) box.removeChild(box.lastChild);
+  }
 }
 
 function findByUrl(url) {
@@ -255,80 +426,130 @@ async function aiSearch(q, items) {
   }
 }
 
-// ---------- 上传 ----------
-// silent=true 时不弹确认框(快速添加自动上传场景)
+// ---------- 上传:增量 ----------
+// 与基线 diff 出变更节点(新增/修改/移动/删除),只上传这些;服务端按条 LWW 合并
 async function upload(silent = false) {
-  // 页面加载后配置可能已变化:先重新拉一次再判断
   if (state.config.storageType === 'none') state.config = await fetchConfig();
   if (state.config.storageType === 'none') { setStatus('未配置存储:请在 .env 或 Vercel 环境变量中配置 S3 / WebDAV'); return; }
-  if (!silent && !confirm('将当前书签数据上传到远程存储?' + (state.config.uploadMode === 'dated' ? '\n(带日期后缀模式,会生成新文件)' : '\n(覆盖模式,将覆盖远程文件)'))) return;
+  if (!state.tree) { setStatus('还没有书签数据'); return; }
+  const upserts = diffNodes(state.base, state.tree, state.meta, Date.now());
+  if (!upserts.length && !state.dirty) { if (!silent) setStatus('没有需要上传的更改'); return; }
+  if (!silent && !confirm('将本次更改上传到云端?\n(增量上传,只传有改动的书签;与其他设备的修改按条自动合并)')) return;
   setStatus(silent ? '自动上传中…' : '上传中…');
   try {
-    applyClicksToAttrs(state.tree);
-    const content = serializeBookmarkHTML(state.tree);
-    const r = await api('/api/bookmark', {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ type: 'bookmark', content })
-    });
-    const j = await r.json();
-    if (!r.ok || !j.ok) throw new Error(j.error || r.status);
-    await syncMetaNow();
-    if (j.etag) state.etag = j.etag;
+    let j = await putUpserts(upserts);
+    if (j && j.conflict) {
+      // 云端历史被另一端整份重建:换到云端基线,重算差异再传一次
+      rebaseFromServer(j);
+      j = await putUpserts(diffNodes(state.base, state.tree, state.meta, Date.now()));
+      if (j && j.conflict) throw new Error('云端数据正被其他设备重建,请稍后重试');
+    }
+    if (!j || !j.ok) throw new Error((j && j.error) || '上传失败');
     clearDirty();
-    updateDirtyBadge();
-    setStatus('✅ 已上传:' + j.file);
+    applySyncDelta(j);   // 响应里带回了我们自己的变更 + 并发端的新变更
+    await syncMetaNow();
+    setStatus('✅ 已上传(增量 ' + upserts.length + ' 条)');
   } catch (e) { setStatus('❌ 上传失败:' + e.message); }
 }
 
-// ---------- 本地文件覆盖云端 ----------
+async function putUpserts(nodes) {
+  const r = await api('/api/sync', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, cache: 'no-store',
+    body: JSON.stringify({ lineage: state.lineage, since: state.since, nodes })
+  });
+  const j = await r.json().catch(() => ({}));
+  if (r.status === 409) j.conflict = true;
+  return j;
+}
+
+// ---------- 同步云端到本地 ----------
+// 强制拉取云端全量覆盖本地缓存;解决 B 端改过数据后 A 端一直读缓存的问题
+async function syncFromCloud() {
+  if (state.config.storageType === 'none') state.config = await fetchConfig();
+  if (state.config.storageType === 'none') { setStatus('未配置存储:没有云端数据可同步'); return; }
+  if (state.dirty && !confirm('本地有未上传的修改。\n同步云端会丢弃这些修改,以云端数据为准。继续?')) return;
+  const btn = $('#sync-btn');
+  btn.disabled = true;
+  setStatus('正在同步云端…');
+  try {
+    const r = await api('/api/sync?since=0', { cache: 'no-store' });
+    if (r.status === 404) {
+      await migrateFromLegacy();
+      return;
+    }
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      throw new Error(j.error || r.status);
+    }
+    const j = await r.json();
+    clearDirty();
+    applySyncDelta(j);
+    await mergeRemote();
+    // 退出搜索态,直接展示最新树
+    $('#search').value = '';
+    $('#results').hidden = true;
+    $('#tree').hidden = false;
+    setStatus('✅ 已同步云端最新数据');
+  } catch (e) { setStatus('❌ 同步失败:' + e.message); }
+  finally { btn.disabled = false; }
+}
+
+// ---------- 导出 / 本地文件覆盖云端 ----------
+// 把当前书签导出为浏览器可直接导入的 Netscape HTML
+function exportCurrentHtml() {
+  if (!state.tree) { setStatus('还没有书签数据'); return; }
+  applyClicksToAttrs(state.tree);
+  const blob = new Blob([serializeBookmarkHTML(state.tree)], { type: 'text/html' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'bookmarks.html';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  setStatus('已导出浏览器书签 HTML(bookmarks.html)');
+}
+
 function pickLocalFile() {
   if (state.config.storageType === 'none') { setStatus('未配置存储:请在 .env 或 Vercel 环境变量中配置 S3 / WebDAV'); return; }
   $('#import-file').click();
 }
 
-// 下载云端最新的书签 HTML(服务端带 Content-Disposition,文件名为云端实际文件名)
-function downloadCloud() {
-  if (state.config.storageType === 'none') { setStatus('未配置存储:没有云端数据可下载'); return; }
-  const token = localStorage.getItem(AUTH_KEY) || '';
-  const a = document.createElement('a');
-  a.href = '/api/bookmark?type=bookmark&download=1' + (token ? '&auth=' + encodeURIComponent(token) : '');
-  a.download = '';
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setStatus('已开始下载云端书签文件');
-}
-
+// 支持 HTML(浏览器导出)与 JSON(此前导出的节点数据)两种来源,整份替换云端
 async function importLocalFile(file) {
   const btn = $('#import-btn');
   btn.disabled = true;
   try {
-    const content = await file.text();
-    const tree = parseBookmarkHTML(content);
+    const text = await file.text();
+    let recs = null;
+    const s = text.trimStart();
+    if (s.startsWith('{') || s.startsWith('[')) {
+      try {
+        const j = JSON.parse(text);
+        const arr = Array.isArray(j) ? j : (Array.isArray(j.nodes) ? j.nodes : null);
+        if (arr && arr.some(n => n && n.id)) recs = arr.filter(n => n && n.id && !n.deleted);
+      } catch { /* 不是合法 JSON,按 HTML 处理 */ }
+    }
+    let tree = null;
+    if (recs) tree = nodesToTree(recs);
+    else { tree = parseBookmarkHTML(text); recs = treeToNodes(tree); }
     const c = countNodes(tree);
     if (!c.bookmarks && !c.folders) { setStatus('文件解析失败:没有读到任何书签,已取消'); return; }
-    const cur = countNodes(state.tree);
+    const cur = countNodes(state.tree || nodesToTree([]));
     const warn = state.dirty ? '\n⚠ 你当前有未上传的本地修改,会被该文件替换。' : '';
-    if (!confirm(`将用本地文件「${file.name}」覆盖云端:\n书签 ${cur.bookmarks} → ${c.bookmarks},文件夹 ${cur.folders} → ${c.folders}` +
-      (state.config.uploadMode === 'dated' ? '\n(强制覆盖主文件,并把 latest.json 指针指回它)' : '\n(覆盖模式)') + warn)) return;
+    if (!confirm(`将用文件「${file.name}」覆盖云端:\n书签 ${cur.bookmarks} → ${c.bookmarks},文件夹 ${cur.folders} → ${c.folders}\n(整份替换,云端历史重置)` + warn)) return;
     setStatus('覆盖上传中…');
-    const r = await api('/api/bookmark', {
+    const now = Date.now();
+    for (const r of recs) r.updatedAt = now;
+    const r = await api('/api/sync', {
       method: 'PUT', headers: { 'Content-Type': 'application/json' }, cache: 'no-store',
-      body: JSON.stringify({ type: 'bookmark', content, overwrite: true })
+      body: JSON.stringify({ lineage: newId(), replace: true, nodes: recs })
     });
-    const j = await r.json();
+    const j = await r.json().catch(() => ({}));
     if (!r.ok || !j.ok) throw new Error(j.error || r.status);
-    // 云端已等于该文件:同步页面数据树,清 dirty,避免两边分叉
-    state.tree = tree;
-    buildIndex(state.tree);
-    syncClicksFromAttrs(state.tree);
-    state.etag = j.etag || null;
     clearDirty();
-    flatCache = null;
-    renderTree($('#tree'));
-    renderRecents();
-    updateDirtyBadge();
-    setStatus('✅ 已覆盖云端:' + j.file + `(书签 ${c.bookmarks} 条)`);
+    applySyncDelta(j);
+    setStatus('✅ 已覆盖云端:' + file.name + `(书签 ${c.bookmarks} 条)`);
   } catch (e) {
     setStatus('❌ 覆盖失败:' + e.message);
   } finally {
@@ -659,13 +880,14 @@ function wireButtons() {
   $('#add-bm-btn').onclick = () => openBookmarkModal({ mode: 'add' });
   $('#add-folder-btn').onclick = () => openFolderModal({ mode: 'add' });
   $('#upload-btn').onclick = () => upload();
-  // 更多菜单:低频功能(下载/覆盖/快速添加)收进下拉
+  $('#sync-btn').onclick = () => syncFromCloud();
+  // 更多菜单:低频功能(导出/覆盖/快速添加)收进下拉
   const moreBtn = $('#more-btn'), moreMenu = $('#more-menu');
   moreBtn.onclick = e => { e.stopPropagation(); moreMenu.hidden = !moreMenu.hidden; };
   document.addEventListener('click', e => {
     if (!e.target.closest('.more-wrap')) moreMenu.hidden = true;
   });
-  $('#download-btn').onclick = () => { moreMenu.hidden = true; downloadCloud(); };
+  $('#download-btn').onclick = () => { moreMenu.hidden = true; exportCurrentHtml(); };
   $('#import-btn').onclick = () => { moreMenu.hidden = true; pickLocalFile(); };
   $('#import-file').onchange = e => {
     const f = e.target.files && e.target.files[0];

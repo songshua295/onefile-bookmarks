@@ -1,25 +1,74 @@
+import { treeToNodes } from './model.js';
+
 export const state = {
   tree: null,
+  base: {},            // 上次同步的扁平节点基线(服务端状态),diff/增量上传的参照
+  since: 0,            // 上次同步到的云端 updatedAt(增量拉取的游标)
+  rev: 0,
+  lineage: null,       // 云端数据谱系 id;被整份重建后变化,用于检测分叉
+  etag: null,
   config: { storageType: 'none', uploadMode: 'overwrite', autoUpload: false, aiEnabled: false },
   meta: { counts: {} },
-  etag: null,
   dirty: false
 };
 
-const CK = 'bm_cache_v1';
 const MK = 'bm_meta_v1';
 const EK = 'bm_expand_v1';
 
-export function loadCache() {
-  try { return JSON.parse(localStorage.getItem(CK)); } catch { return null; }
+// ---- 本地缓存:IndexedDB ----
+// 相比 localStorage:容量大(不受 5MB 限制)、异步读写不阻塞主线程;
+// 缓存的是解析后的扁平节点 + 基线,刷新页面免解析、免下载,首屏秒开
+let dbPromise = null;
+function openDb() {
+  if (!dbPromise) {
+    dbPromise = new Promise((resolve, reject) => {
+      const rq = indexedDB.open('bm_cache', 1);
+      rq.onupgradeneeded = () => { rq.result.createObjectStore('kv'); };
+      rq.onsuccess = () => resolve(rq.result);
+      rq.onerror = () => reject(rq.error);
+    });
+  }
+  return dbPromise;
 }
-// 整棵树 stringify 开销大:变更后防抖写入,页面隐藏/关闭前立即 flush
+async function idbGet(key) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const t = db.transaction('kv').objectStore('kv').get(key);
+    t.onsuccess = () => resolve(t.result);
+    t.onerror = () => reject(t.error);
+  });
+}
+function idbPut(key, val) {
+  return openDb().then(db => new Promise((resolve, reject) => {
+    const t = db.transaction('kv', 'readwrite').objectStore('kv').put(val, key);
+    t.onsuccess = () => resolve();
+    t.onerror = () => reject(t.error);
+  })).catch(e => console.warn('缓存写入失败', e));
+}
+
+// 返回 v2 缓存 { v,nodes,base,since,rev,lineage,etag,dirty } 或旧版 v1 缓存 { tree,etag,dirty }
+export async function loadCache() {
+  try {
+    const v = await idbGet('state');
+    if (v && v.v === 2 && Array.isArray(v.nodes)) return v;
+  } catch { /* IndexedDB 不可用(如隐私模式) */ }
+  try { return JSON.parse(localStorage.getItem('bm_cache_v1') || 'null'); } catch { return null; }
+}
+
+// 整树序列化开销大:变更后防抖写入,页面隐藏/关闭前立即 flush
 let saveTimer = null;
 function saveNow() {
   if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+  if (!state.tree) return;
   try {
-    localStorage.setItem(CK, JSON.stringify({ tree: state.tree, etag: state.etag, dirty: state.dirty, savedAt: Date.now() }));
-  } catch (e) { console.warn('本地缓存写入失败(可能超出容量)', e); }
+    idbPut('state', {
+      v: 2,
+      nodes: treeToNodes(state.tree, state.base),
+      base: state.base,
+      since: state.since, rev: state.rev, lineage: state.lineage, etag: state.etag,
+      dirty: state.dirty, savedAt: Date.now()
+    });
+  } catch (e) { console.warn('本地缓存序列化失败', e); }
 }
 export function saveCache() {
   if (saveTimer) return;
@@ -91,8 +140,7 @@ export function clicksClass(n) {
   return 'ct5';
 }
 
-// 上传前调用:把本地点击次数写入节点属性,序列化成 CLICKS="n"。
-// 浏览器导入书签时会忽略这个未知属性,不受影响。
+// 导出 HTML 前调用:把本地点击次数写入节点属性,序列化成 CLICKS="n"
 export function applyClicksToAttrs(tree) {
   (function walk(n) {
     if (n.type === 'bookmark' && n.url) {
@@ -103,7 +151,7 @@ export function applyClicksToAttrs(tree) {
   })(tree);
 }
 
-// 加载/导入后调用:从属性恢复点击次数,与本地记录取较大值
+// 加载/同步后调用:从属性恢复点击次数,与本地记录取较大值
 export function syncClicksFromAttrs(tree) {
   (function walk(n) {
     if (n.type === 'bookmark' && n.url) {

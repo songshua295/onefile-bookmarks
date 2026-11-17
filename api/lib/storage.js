@@ -97,19 +97,31 @@ async function get(key) {
   return { content: await res.text(), etag: res.headers.get('etag') };
 }
 
-async function put(key, content) {
+// opts.ifMatch:条件写(RFC 条件请求 If-Match 头)。S3 条件写/WebDAV 均支持;
+// 对象已被并发修改时服务端返回 412,抛出 code='PRECONDITION' 由调用方重读重合并
+async function put(key, content, opts = {}) {
   const type = getType();
+  const ifMatch = opts.ifMatch || null;
   let res;
   if (type === 's3') {
-    res = await (await awsClient()).fetch(s3Url(key), { method: 'PUT', body: content });
+    res = await (await awsClient()).fetch(s3Url(key), {
+      method: 'PUT',
+      body: content,
+      headers: ifMatch ? { 'If-Match': ifMatch } : {}
+    });
   } else if (type === 'webdav') {
     res = await fetch(webdavUrl(key), {
       method: 'PUT',
-      headers: webdavHeaders({ 'Content-Type': 'text/html; charset=utf-8' }),
+      headers: webdavHeaders(Object.assign({ 'Content-Type': 'text/html; charset=utf-8' }, ifMatch ? { 'If-Match': ifMatch } : {})),
       body: content
     });
   } else throw new Error('未配置存储');
-  if (!res.ok) throw new Error(`${type.toUpperCase()} PUT ${key} 失败: HTTP ${res.status} ${await safeText(res)}`);
+  if (!res.ok) {
+    const text = await safeText(res);
+    const err = new Error(`${type.toUpperCase()} PUT ${key} 失败: HTTP ${res.status} ${text}`);
+    if (res.status === 412 || /precondition/i.test(text)) err.code = 'PRECONDITION';
+    throw err;
+  }
   return res.headers.get('etag');
 }
 

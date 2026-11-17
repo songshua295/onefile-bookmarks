@@ -20,6 +20,7 @@ const auth = require('./api/lib/auth');
 const configHandler = require('./api/config');
 const authHandler = require('./api/auth');
 const bookmarkHandler = require('./api/bookmark');
+const syncHandler = require('./api/sync');
 const aiHandler = require('./api/ai');
 const categorizeHandler = require('./api/categorize');
 
@@ -55,6 +56,7 @@ const server = http.createServer(async (req, res) => {
   // 其余 API 需要访问口令(未配置 ACCESS_PASSWORD 时 auth.check 直接放行)
   if (!auth.check(req)) { auth.reject(shim(req, res)); return; }
   if (u.pathname === '/api/bookmark') return bookmarkHandler(req, shim(req, res));
+  if (u.pathname === '/api/sync') return syncHandler(req, shim(req, res));
   if (u.pathname === '/api/ai') return aiHandler(req, shim(req, res));
   if (u.pathname === '/api/categorize') return categorizeHandler(req, shim(req, res));
 
